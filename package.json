@@ -1,0 +1,18 @@
+{
+  "name": "tlbg-verifier-worker",
+  "version": "1.0.0",
+  "description": "External SMTP verifier worker for the TLBG Prospect Intelligence platform. Pulls jobs from verification-worker-api and verifies via an open-source engine.",
+  "private": true,
+  "type": "module",
+  "main": "worker.mjs",
+  "scripts": {
+    "start": "node worker.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "undici": "^6.19.8"
+  },
+  "license": "UNLICENSED"
+}
