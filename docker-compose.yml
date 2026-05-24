@@ -1,14 +1,18 @@
 services:
   email-verifier:
-    # AfterShip email-verifier — MIT licensed Go SMTP verifier.
-    # https://github.com/AfterShip/email-verifier
-    image: ghcr.io/aftership/email-verifier:latest
+    # Built locally from ./engine — wraps the open-source AfterShip
+    # email-verifier Go library (MIT). No private registry images.
+    build: ./engine
     container_name: tlbg-email-verifier
     restart: unless-stopped
     expose:
       - "8080"
     environment:
-      - VERIFIER_LISTEN=:8080
+      # Most PaaS (Railway, Fly free, Render) block outbound port 25.
+      # Set to "0" only when running on a host with SMTP egress.
+      - DISABLE_SMTP_CHECK=${DISABLE_SMTP_CHECK:-0}
+      - SMTP_HELO_NAME=${SMTP_HELO_NAME:-}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-}
 
   worker:
     build: .

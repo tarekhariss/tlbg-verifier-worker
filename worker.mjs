@@ -1,43 +1,23 @@
-// TLBG External Verifier Worker
+// TLBG External Verifier Worker — reference implementation.
 //
-// Standalone Node.js worker that connects to the TLBG Prospect Intelligence
-// platform's `verification-worker-api` edge function, claims pending email
-// verification jobs, verifies them via an open-source SMTP verifier engine
-// (default: AfterShip email-verifier), and submits canonical results back.
+// Pulls jobs from verification-worker-api, verifies through an open-source
+// SMTP verifier engine (default: AfterShip email-verifier), and submits
+// results back. Never fakes data.
 //
-// NEVER fakes data. NEVER simulates results.
+// Run via Docker: see docker-compose.yml.
 //
 // Required env:
-//   SUPABASE_WORKER_API_URL   Full URL to verification-worker-api
-//                             e.g. https://YOUR-PROJECT.supabase.co/functions/v1/verification-worker-api
-//   VERIFICATION_WORKER_SECRET  Shared secret (matches platform secret)
-//   VERIFIER_URL              URL of the SMTP verifier engine (default http://email-verifier:8080)
+//   SUPABASE_URL, VERIFICATION_WORKER_SECRET, WORKER_ID, VERIFIER_URL
 
 import { request } from "undici";
 import { setTimeout as sleep } from "node:timers/promises";
 
-function requireEnv(k) {
-  const v = process.env[k];
-  if (!v) { console.error(`Missing env: ${k}`); process.exit(1); }
-  return v;
-}
-
-// Back-compat: accept SUPABASE_URL + auto-append the function path.
-function resolveBaseUrl() {
-  const direct = process.env.SUPABASE_WORKER_API_URL;
-  if (direct) return direct.replace(/\/+$/, "");
-  const supa = process.env.SUPABASE_URL;
-  if (supa) return `${supa.replace(/\/+$/, "")}/functions/v1/verification-worker-api`;
-  console.error("Missing env: SUPABASE_WORKER_API_URL");
-  process.exit(1);
-}
-
 const cfg = {
-  base: resolveBaseUrl(),
+  base: `${requireEnv("SUPABASE_URL")}/functions/v1/verification-worker-api`,
   secret: requireEnv("VERIFICATION_WORKER_SECRET"),
   workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
   workerVersion: process.env.WORKER_VERSION ?? "1.0.0",
-  host: process.env.WORKER_HOST ?? process.env.RAILWAY_REGION ?? "unknown",
+  host: process.env.WORKER_HOST ?? "unknown",
   verifierUrl: process.env.VERIFIER_URL ?? "http://email-verifier:8080",
   engine: process.env.VERIFIER_ENGINE ?? "aftership-email-verifier",
   engineVersion: process.env.VERIFIER_VERSION ?? "unknown",
@@ -48,6 +28,12 @@ const cfg = {
   perDomainDelay: Number(process.env.PER_DOMAIN_DELAY_MS ?? 5000),
   maxRetries: Number(process.env.MAX_RETRIES ?? 3),
 };
+
+function requireEnv(k) {
+  const v = process.env[k];
+  if (!v) { console.error(`Missing env: ${k}`); process.exit(1); }
+  return v;
+}
 
 const stats = { processed: 0, inFlight: 0, latencies: [], lastError: null };
 const lastDomainHitAt = new Map();
@@ -82,6 +68,7 @@ async function verifyEmail(email) {
 
   if (res.statusCode >= 500) throw new Error(`engine_5xx:${res.statusCode}`);
 
+  // Map engine output → canonical platform shape. Never invent fields.
   const syntaxValid = !!body?.syntax?.valid;
   const mxValid = !!body?.has_mx_records;
   const smtpDeliverable = !!body?.smtp?.deliverable;
@@ -89,7 +76,7 @@ async function verifyEmail(email) {
   const isCatchAll = !!body?.smtp?.catch_all;
   const isDisposable = !!body?.disposable;
   const isRole = !!body?.role_account;
-  const reachable = body?.reachable ?? "unknown";
+  const reachable = body?.reachable ?? "unknown"; // yes | no | unknown
 
   let status = "unknown";
   if (!syntaxValid) status = "invalid";
@@ -141,6 +128,7 @@ async function verifyEmail(email) {
   };
 }
 
+// ---- Per-domain throttle ----
 async function throttleDomain(email) {
   const domain = email.split("@")[1]?.toLowerCase() ?? "";
   const last = lastDomainHitAt.get(domain) ?? 0;
@@ -149,6 +137,7 @@ async function throttleDomain(email) {
   lastDomainHitAt.set(domain, Date.now());
 }
 
+// ---- Process a single claimed job ----
 async function processOne(job) {
   stats.inFlight++;
   try {
@@ -175,8 +164,10 @@ async function processOne(job) {
         await sleep(1000 * attempt);
       }
     }
+    // Transient: report /fail so platform reschedules
     await api("/fail", { result_id: job.result_id ?? job.id, error: String(lastErr?.message ?? lastErr) });
   } catch (e) {
+    // Permanent: push to DLQ
     stats.lastError = String(e?.message ?? e);
     await api("/dead-letter", {
       workspace_id: job.workspace_id,
@@ -192,6 +183,7 @@ async function processOne(job) {
   }
 }
 
+// ---- Main loops ----
 async function heartbeatLoop() {
   for (;;) {
     try {
@@ -219,13 +211,17 @@ async function heartbeatLoop() {
 async function claimLoop() {
   for (;;) {
     try {
-      if (stats.inFlight >= cfg.concurrency) { await sleep(500); continue; }
+      if (stats.inFlight >= cfg.concurrency) {
+        await sleep(500); continue;
+      }
       const room = cfg.concurrency - stats.inFlight;
       const limit = Math.min(cfg.claimBatch, room);
 
+      // Pick the workspace_id from first claimed job to check quota
       const { batch } = await api("/claim", { limit });
       if (!batch?.length) { await sleep(cfg.claimInterval); continue; }
 
+      // Pre-flight quota check per workspace
       const byWs = new Map();
       for (const j of batch) {
         if (!byWs.has(j.workspace_id)) byWs.set(j.workspace_id, []);
@@ -243,6 +239,7 @@ async function claimLoop() {
           }
           continue;
         }
+        // Fire-and-track
         for (const j of jobs) processOne(j);
       }
     } catch (e) {

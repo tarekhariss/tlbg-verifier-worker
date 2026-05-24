@@ -1,179 +1,200 @@
-# TLBG Verifier Worker
+# TLBG External Verifier Worker
 
-Standalone external worker for the **TLBG Prospect Intelligence** platform.
-Pulls pending email verification jobs from the platform's
-`verification-worker-api` edge function, verifies them through an
-open-source SMTP verifier engine, and submits canonical results back.
+Reference implementation of an external SMTP email-verification worker that
+plugs into the TLBG Verification Platform via the `verification-worker-api`
+edge function.
 
-**Never** fakes data. **Never** simulates results.
-
-```
-TLBG Platform (Lovable + Supabase)
-        │  verification-worker-api  (x-worker-secret auth)
-        ▼
-TLBG Verifier Worker  (this repo)
-        │  HTTP
-        ▼
-Open-source verifier engine (AfterShip email-verifier / truemail-go)
-        │  SMTP / MX
-        ▼
-Email service providers
-```
+> The actual SMTP verification engine runs **outside** Lovable. This worker
+> is a thin orchestrator that pulls jobs, hands them to an open-source
+> verifier engine, and submits results back. It must never fake successful
+> verifications.
 
 ---
 
-## Repository layout
+## Recommended architecture
 
 ```
-tlbg-verifier-worker/
-├── worker.mjs            # Worker process (claim → verify → submit)
-├── package.json
-├── Dockerfile            # Production container
-├── docker-compose.yml    # Local dev: worker + email-verifier engine
-├── railway.json          # Railway build/deploy config
-├── .env.example
-├── .dockerignore
-└── .gitignore
+Lovable / Supabase platform
+        │  (verification_results, _jobs, _workers, …)
+        ▼
+verification-worker-api  (edge function, JWT + x-worker-secret protected)
+        │
+        ▼
+External Verifier Worker  (this package — Docker container)
+        │
+        ▼
+Open-source verifier engine
+   • AfterShip email-verifier  (Go, MIT) — preferred
+   • truemail-go               (Go, MIT) — alternative
+   • Reacher                   (only after licensing review)
+        │
+        ▼
+SMTP / MX providers (Gmail, Outlook, custom MTAs, …)
 ```
+
+The platform never reaches an SMTP server directly. Only this worker does.
+That keeps Lovable's IPs out of SMTP reputation systems and lets you scale
+egress independently behind your own outbound IPs / proxies.
 
 ---
 
-## Required environment variables
+## Quick start (Docker Compose, local)
 
-| Variable                       | Required | Description |
-|--------------------------------|----------|-------------|
-| `SUPABASE_WORKER_API_URL`      | yes      | Full URL to `verification-worker-api` (e.g. `https://YOUR-PROJECT.supabase.co/functions/v1/verification-worker-api`). |
-| `VERIFICATION_WORKER_SECRET`   | yes      | Shared secret — must match the platform secret. Sent as `x-worker-secret`. |
-| `VERIFIER_URL`                 | yes      | URL of the SMTP verifier engine. |
-| `WORKER_ID`                    | no       | Stable worker identifier (default `worker-<pid>`). |
-| `WORKER_VERSION`, `WORKER_HOST`| no       | Reported via `/heartbeat`. |
-| `VERIFIER_ENGINE`, `VERIFIER_VERSION` | no | Engine metadata reported with each result. |
-| `CLAIM_BATCH_SIZE`             | no       | Default `50`. |
-| `CLAIM_INTERVAL_MS`            | no       | Default `5000`. |
-| `HEARTBEAT_INTERVAL_MS`        | no       | Default `60000`. |
-| `MAX_CONCURRENCY`              | no       | Default `10`. |
-| `PER_DOMAIN_DELAY_MS`          | no       | Default `5000`. |
-| `MAX_RETRIES`                  | no       | Default `3`. |
+1. Copy `.env.example` to `.env` and fill in:
+   - `SUPABASE_URL` — your Lovable Cloud URL
+   - `VERIFICATION_WORKER_SECRET` — the same value set in Lovable
+   - `WORKER_ID` — unique id per running instance (e.g. `worker-eu-1`)
+   - `VERIFIER_URL` — internal URL of the engine (default
+     `http://email-verifier:8080` works with the bundled compose file)
 
-See `.env.example` for a copy-pasteable starter.
+2. Boot it:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+   This builds **two local images** from source:
+   - `./engine` — a small Go HTTP service wrapping the open-source
+     [`AfterShip/email-verifier`](https://github.com/AfterShip/email-verifier)
+     library (MIT). Exposes `GET /v1/{email}/verification` on port 8080.
+   - `.` — this Node worker that pulls jobs and submits results.
+
+   No private registry images are required.
+
+3. In Lovable, open **Verification → API** and confirm:
+   - The worker appears under **Workers** within ~60s
+   - The **Connection Checklist** turns green
+   - Jobs start draining from the queue when you create a verification job
 
 ---
 
-## Deploy to Railway
+## Deploy on Railway
 
-### 1. Push this repo to GitHub
+Create **two services** in the same Railway project, pointed at this repo:
 
-Create a new GitHub repo called `tlbg-verifier-worker` and push the
-contents of this folder to it. Nothing else should live in the repo —
-this worker is intentionally separated from the main TLBG platform repo.
+| Service          | Root directory                  | Notes                                                                                       |
+| ---------------- | ------------------------------- | ------------------------------------------------------------------------------------------- |
+| `email-verifier` | `external/verifier-worker/engine` | Uses `engine/railway.json` + `engine/Dockerfile`. Exposes port 8080. No public domain needed. |
+| `verifier-worker`| `external/verifier-worker`      | Uses `railway.json` + `Dockerfile`. Set env vars below.                                     |
 
-### 2. Create the engine service
-
-In your Railway project click **+ New → Docker Image** and use:
-
-```
-ghcr.io/aftership/email-verifier:latest
-```
-
-Name it `email-verifier`. Expose port `8080` on Railway private networking.
-No public domain is needed.
-
-> ⚠️ Many cloud providers (Railway included) block outbound port 25.
-> If verification responses come back as `unknown`, you'll need an SMTP
-> egress proxy or a provider that allows port 25.
-
-### 3. Create the worker service
-
-Click **+ New → GitHub Repo** and pick `tlbg-verifier-worker`. Railway
-will detect the `Dockerfile` and `railway.json` automatically.
-
-Set the following service variables:
+On the **worker** service set:
 
 ```
-SUPABASE_WORKER_API_URL=https://YOUR-PROJECT.supabase.co/functions/v1/verification-worker-api
-VERIFICATION_WORKER_SECRET=<paste the same value configured on the platform>
+SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+VERIFICATION_WORKER_SECRET=...        # same value as Lovable secret
+WORKER_ID=worker-railway-1
 VERIFIER_URL=http://email-verifier.railway.internal:8080
-WORKER_ID=railway-worker-1
-VERIFIER_ENGINE=aftership-email-verifier
-VERIFIER_VERSION=1.7.2
 ```
 
-(Use Railway **private networking** for `VERIFIER_URL` — the
-`email-verifier.railway.internal` hostname is auto-created when both
-services share a project.)
+On the **engine** service set (recommended on Railway, which blocks port 25):
 
-### 4. Verify
-
-Within ~60 seconds the worker should:
-
-1. Appear in the platform's **Verification → Engines Registry** as `online`.
-2. Start claiming jobs and posting results to `/submit`.
-
-The platform's **Verification → API Management** page exposes
-`/health` and a checklist that flips to ✅ once the worker is connected.
-
----
-
-## Run locally (docker-compose)
-
-```bash
-cp .env.example .env
-# edit .env: set SUPABASE_WORKER_API_URL + VERIFICATION_WORKER_SECRET
-docker compose up --build
+```
+DISABLE_SMTP_CHECK=1
 ```
 
-This starts both the AfterShip engine container and the worker.
+With `DISABLE_SMTP_CHECK=1` the engine returns syntax + MX + disposable +
+role-based + catch-all heuristics; SMTP deliverability is reported as
+`unknown` and the worker submits `status: "unknown"` rather than fabricating
+a `valid`. To get real SMTP probing, run the engine on a host with outbound
+port 25 (a small VPS works) and unset `DISABLE_SMTP_CHECK`.
 
 ---
 
-## Run locally without Docker
+## Worker behaviour (must implement exactly)
 
-```bash
-npm install
-export SUPABASE_WORKER_API_URL=...
-export VERIFICATION_WORKER_SECRET=...
-export VERIFIER_URL=http://localhost:8080   # your engine
-node worker.mjs
+| Frequency      | Endpoint        | Purpose                                       |
+| -------------- | --------------- | --------------------------------------------- |
+| Every 5–15s    | `POST /claim`   | Pull up to N pending verification jobs         |
+| Per job        | `POST /submit`  | Submit verification result                    |
+| Every 60s      | `POST /heartbeat` | Report status, in-flight, latency, version  |
+| On retryable error | `POST /fail` | Mark transient failure (job is retried)       |
+| On permanent failure | `POST /dead-letter` | Push to DLQ with reason                  |
+| Before batch   | `POST /quota`   | Check workspace quota before consuming        |
+| On bounce data | `POST /bounce`  | Forward bounce feedback from SMTP MTA logs    |
+
+Every request **must** include:
+
+```
+x-worker-secret: $VERIFICATION_WORKER_SECRET
+content-type: application/json
 ```
 
----
-
-## How the worker talks to the platform
-
-All calls are `POST` with `x-worker-secret: <shared secret>` and
-`content-type: application/json`.
-
-| Endpoint        | When | Payload |
-|-----------------|------|---------|
-| `/claim`        | Continuously | `{ limit }` → returns `{ batch: [...] }` |
-| `/quota`        | Per workspace per batch | `{ workspace_id, consume: true, count }` |
-| `/submit`       | After successful verification | Canonical result object |
-| `/fail`         | After transient failure | `{ result_id, error }` |
-| `/dead-letter`  | After permanent failure / quota block | `{ workspace_id, result_id, email, reason, ... }` |
-| `/heartbeat`    | Every `HEARTBEAT_INTERVAL_MS` | Worker status + metrics |
-| `/health`       | Optional GET | Liveness probe |
-
-The platform applies workspace scoping, rules, suppression, and
-attribution downstream of `/submit`. The worker only verifies and
-reports.
+If the secret is missing or wrong the API returns `401`.
 
 ---
 
-## Engines
+## `/submit` payload (canonical)
 
-- **Default**: [AfterShip email-verifier](https://github.com/AfterShip/email-verifier) — MIT licensed.
-- **Alternative**: [truemail-go](https://github.com/truemail-rb/truemail-go) — also OSS.
-- **Reacher**: only after confirming licensing. Do not enable by default.
+```jsonc
+{
+  "result_id":              "<uuid from /claim>",
+  "email":                  "jane.doe@example.com",
+  "normalized_email":       "jane.doe@example.com",
+  "status":                 "valid | invalid | catch_all | unknown | risky | disposable | failed",
+  "confidence_score":       0.0,        // 0..1
+  "risk_level":             "low | medium | high",
+  "risk_reasons":           ["role_based", "free_provider"],
 
-To swap engines, replace the `verifyEmail()` adapter in `worker.mjs`
-and update `VERIFIER_ENGINE` / `VERIFIER_VERSION`.
+  "syntax_result":          { "valid": true,  "reason": null },
+  "mx_result":              { "valid": true,  "records": ["aspmx.l.google.com"] },
+  "smtp_result":            { "valid": true,  "deliverable": true, "full_inbox": false },
+  "catch_all_result":       { "is_catch_all": false, "confidence": 0.94 },
+  "disposable_result":      { "is_disposable": false },
+  "role_based_result":      { "is_role_based": false },
+
+  "mx_provider":            "google",
+  "smtp_response_code":     250,
+  "smtp_response_message":  "2.1.5 OK",
+
+  "source_engine":          "aftership-email-verifier",
+  "engine_version":         "1.7.2",
+  "engine_latency_ms":      482,
+  "retry_count":            0,
+  "verified_at":            "2026-05-24T10:00:00.000Z"
+}
+```
+
+Any field you can't compute should be omitted or set to `null`. **Never
+invent values** — `unknown` is the correct status when the engine cannot
+make a determination.
+
+---
+
+## Supported open-source engines
+
+| Engine                          | Language | License | Notes                                              |
+| ------------------------------- | -------- | ------- | -------------------------------------------------- |
+| AfterShip `email-verifier`      | Go       | MIT     | Preferred. Mature, Dockerised, returns rich JSON. |
+| `truemail-go`                   | Go       | MIT     | Good alternative, simpler API.                    |
+| Reacher                         | Rust     | mixed   | Only after a licensing review.                    |
+
+This package ships with AfterShip's `email-verifier` by default.
+
+---
+
+## Operational notes
+
+- Run **one worker per outbound IP**. SMTP reputation is per IP.
+- Throttle per-domain: max ~1 SMTP probe / 5s / domain to avoid greylisting.
+- Use SOCKS5 / SMTP proxies for fan-out; pass them via `PROXY_URL`.
+- Retry transient errors (4xx SMTP, timeouts) up to 3 times before
+  reporting `/fail`. After 3 fails the platform auto-escalates to DLQ.
+- Treat `421` and `4xx` as transient; `5xx` and `550` as permanent.
+- Never override the `status` of a previously verified result — submit a
+  new result row.
 
 ---
 
 ## Security
 
-- The shared secret is the only authentication boundary. Treat it as a
-  production credential.
-- Never log the secret. Never expose it client-side.
-- Rotate by updating the platform secret and the worker env var in
-  the same window.
+- The worker secret is the **only** credential. Do not commit it.
+- The worker never receives a user JWT and cannot read user data.
+- Outbound SMTP traffic should leave from dedicated IPs you control.
+- Bounce feedback (`/bounce`) feeds the platform's domain reputation
+  model and the campaign safety check.
+
+---
+
+## License
+
+MIT for this connector package. Engine licenses apply separately.
